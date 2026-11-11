@@ -1,0 +1,180 @@
+#!/usr/bin/env bash
+# peek — zoom into huge images (whole-slide pathology, OME-TIFF, big PNG/JPEG) like in QuPath.
+# Tiles are cut on the machine that has the files; you look at them in your local browser.
+#
+#   peek server:/data/slides        browse a folder on a server (any host from ~/.ssh/config)
+#   peek server:/data/a.ome.tif     open one image
+#   peek ~/Pictures                 a local folder or file
+#   peek --setup [server]           install the Python packages it needs there (pip --user)
+#
+# Options: --python PATH (interpreter on the other side), --no-open (just print the URL)
+# https://github.com/liuxiaZzz/peek
+set -uo pipefail
+
+VERSION=1.0.0
+
+# ─── where is peek_server.py? (next to this script, or where install.sh put it) ──────
+self="${BASH_SOURCE[0]}"
+while [[ -L $self ]]; do                      # follow symlinks (no readlink -f on older macOS)
+  dir="$(cd "$(dirname "$self")" && pwd)"; self="$(readlink "$self")"; [[ $self != /* ]] && self="$dir/$self"
+done
+HERE="$(cd "$(dirname "$self")" && pwd)"
+SERVER=""
+for f in "$HERE/peek_server.py" "${XDG_DATA_HOME:-$HOME/.local/share}/peek/peek_server.py"; do
+  [[ -f $f ]] && { SERVER=$f; break; }
+done
+
+# ─── look ────────────────────────────────────────────────────────────────────────────
+if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
+  PINK=$'\033[38;2;228;139;180m'; BLUE=$'\033[38;2;122;162;255m'; MUTE=$'\033[38;2;127;132;163m'
+  ROSE=$'\033[38;2;217;100;127m'; BOLD=$'\033[1m'; N=$'\033[0m'
+else PINK=""; BLUE=""; MUTE=""; ROSE=""; BOLD=""; N=""; fi
+say()  { printf '%s\n' "$*"; }
+ok()   { printf '  %s✓%s %s\n' "$PINK" "$N" "$*"; }
+dim()  { printf '  %s%s%s\n' "$MUTE" "$*" "$N"; }
+err()  { printf '  %s!%s %s\n' "$ROSE" "$N" "$*" >&2; }
+
+usage() {
+  cat <<EOF
+${PINK}${BOLD}peek${N} ${MUTE}$VERSION${N} — zoom into huge images like in QuPath, tiles cut where the files are
+
+  ${BLUE}peek server:/path/to/folder${N}     browse a folder on a server in your browser
+  ${BLUE}peek server:/path/to/image${N}      open one image (.svs .ndpi .mrxs .ome.tif .tif .png .jpg …)
+  ${BLUE}peek ~/local/folder${N}             a local folder or image
+  ${BLUE}peek --setup [server]${N}           install the Python packages it needs (pip --user)
+
+  server = anything ssh understands: a name from ~/.ssh/config, or user@host
+  In the browser: scroll to zoom · drag to pan · ←/→ previous/next · Esc back to the folder
+  Here: Ctrl-C to stop (closing the terminal stops it too).
+
+  Options: --python PATH   use this Python on the other side
+           --no-open       don't open a browser, just print the URL
+EOF
+}
+
+# ─── arguments ───────────────────────────────────────────────────────────────────────
+PYTHON="${PEEK_PYTHON:-}"; OPEN=1; SETUP=0; TARGET=""; SETUP_HOST=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h|--help) usage; exit 0 ;;
+    -V|--version) say "peek $VERSION"; exit 0 ;;
+    --python) PYTHON="${2:?--python needs a path}"; shift 2 ;;
+    --no-open) OPEN=0; shift ;;
+    --setup) SETUP=1; shift; [[ $# -gt 0 && $1 != -* ]] && { SETUP_HOST=$1; shift; } ;;
+    -*) err "unknown option: $1"; usage; exit 1 ;;
+    *) TARGET=$1; shift ;;
+  esac
+done
+
+# Shell snippet that sets $PY to the best Python on that machine: Pillow is required;
+# tifffile+zarr (OME-TIFF / pyramidal TIFF) and openslide (.svs .ndpi .mrxs …) add points.
+# conda envs are searched too, so an existing analysis env is reused.
+PICK_PY='PY=$PEEK_PY; if [ -z "$PY" ]; then best=-1; for p in "$HOME"/miniconda3/envs/*/bin/python "$HOME"/anaconda3/envs/*/bin/python "$HOME"/miniforge3/envs/*/bin/python "$HOME"/mambaforge/envs/*/bin/python "$HOME/miniconda3/bin/python3" "$HOME/anaconda3/bin/python3" "$HOME/miniforge3/bin/python3" "$HOME/mambaforge/bin/python3" "$(command -v python3)"; do [ -x "$p" ] || continue; sc=$("$p" -c "import importlib.util as u; f=u.find_spec; print((f(\"PIL\") is not None) * (1 + 4*(f(\"tifffile\") is not None and f(\"zarr\") is not None and f(\"numpy\") is not None) + 2*(f(\"openslide\") is not None)))" 2>/dev/null) || continue; [ "$sc" -gt "$best" ] && { best=$sc; PY=$p; }; [ "$sc" -ge 7 ] && break; done; fi; [ -n "$PY" ] || { echo "DUSK_VIEW_ERROR no python3 found"; exit 2; }'
+
+quote() { printf "'%s'" "${1//\'/\'\\\'\'}"; }     # single-quote for a remote shell
+
+setup() {   # setup [host]
+  local host=$1
+  local cmd="PEEK_PY=$(quote "$PYTHON"); $PICK_PY; echo \"→ \$PY\"; \"\$PY\" -m pip install --user --upgrade pillow tifffile imagecodecs zarr openslide-python openslide-bin"
+  printf '  %sInstalling the Python packages peek needs on %s (only in your user folder)%s\n' "$PINK" "${host:-this computer}" "$N"
+  if [[ -n $host ]]; then ssh -o ClearAllForwardings=yes "$host" "$cmd"
+  else sh -c "$cmd"; fi
+}
+
+if (( SETUP )); then setup "$SETUP_HOST"; exit; fi
+[[ -n $TARGET ]] || { usage; exit 1; }
+[[ -n $SERVER ]] || { err "peek_server.py not found next to peek — reinstall with install.sh"; exit 1; }
+
+HOST=""; TPATH=$TARGET
+if [[ ! -e $TARGET && $TARGET == *:* && ${TARGET%%:*} != */* ]]; then
+  HOST=${TARGET%%:*}; TPATH=${TARGET#*:}; [[ -z $TPATH ]] && TPATH=.
+fi
+if [[ -z $HOST && -n ${SSH_CONNECTION:-} ]]; then      # on a server: the browser is on your own computer
+  say "This is a server — the browser is on your own computer. Run this there:"
+  printf '  %speek %s:%s%s\n' "$PINK" "$(hostname -s)" "$(cd "$(dirname "$TPATH")" 2>/dev/null && pwd)/$(basename "$TPATH")" "$N"
+  dim "(use the name this server has in your ~/.ssh/config)"
+  exit 0
+fi
+[[ -n $HOST || -e $TPATH ]] || { err "no such file or folder: $TPATH"; exit 1; }
+
+free_port() {
+  local p i
+  for i in $(seq 1 40); do
+    p=$(( 20000 + RANDOM % 20000 ))
+    (exec 3<>"/dev/tcp/127.0.0.1/$p") 2>/dev/null && continue    # something is listening
+    echo $p; return 0
+  done
+  return 1
+}
+
+open_url() {
+  (( OPEN )) || return 0
+  if [[ $(uname -s) == Darwin ]]; then open "$1"
+  elif command -v wslview >/dev/null 2>&1; then wslview "$1"
+  elif grep -qi microsoft /proc/version 2>/dev/null; then cmd.exe /c start "" "$1" >/dev/null 2>&1
+  elif command -v xdg-open >/dev/null 2>&1; then xdg-open "$1" >/dev/null 2>&1
+  fi
+}
+
+PID=""; LOG=""; ERR=""
+cleanup() { [[ -n $PID ]] && kill "$PID" 2>/dev/null; rm -f "$LOG" "$ERR"; }
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 129' HUP
+trap 'exit 143' TERM
+
+start() {   # start <port>: launch the viewer (remote over ssh, or local) in the background
+  local port=$1
+  LOG=$(mktemp); ERR=$(mktemp)
+  if [[ -n $HOST ]]; then
+    local b64; b64=$(base64 < "$SERVER" | tr -d '\n')
+    local cmd="PEEK_PY=$(quote "$PYTHON"); $PICK_PY; exec \"\$PY\" -u -c \"import base64;exec(compile(base64.b64decode('$b64'),'peek_server','exec'))\" --port $port --brand Peek --path $(quote "$TPATH")"
+    # -tt: a terminal on the server, so the viewer is hung up on when this connection ends
+    ssh -tt -o ServerAliveInterval=30 -o LogLevel=ERROR -L "$port:127.0.0.1:$port" "$HOST" "$cmd" >"$LOG" 2>"$ERR" </dev/null &
+  else
+    "${PYTHON:-python3}" -u "$SERVER" --port "$port" --brand Peek --path "$TPATH" >"$LOG" 2>"$ERR" </dev/null &
+  fi
+  PID=$!
+}
+
+wait_ready() {   # sets STATE to the viewer's first status line, or empty if it died
+  local frames='⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏' i=0
+  [[ "$(locale charmap 2>/dev/null)" == UTF-8 ]] || frames='-\|/-\|/-\|/'
+  STATE=""
+  while (( i < 600 )); do
+    STATE=$(tr -d '\r' < "$LOG" 2>/dev/null | grep -m1 -oE '^DUSK_VIEW_(READY|MISSING|ERROR).*' || true)
+    [[ -n $STATE ]] && break
+    kill -0 "$PID" 2>/dev/null || break
+    [[ -t 1 ]] && printf '\r  %s%s%s starting the viewer on %s…' "$PINK" "${frames:$(( i % 10 )):1}" "$N" "${HOST:-this computer}"
+    i=$(( i + 1 )); sleep 0.1
+  done
+  [[ -t 1 ]] && printf '\r\033[K'
+}
+
+for attempt in 1 2; do
+  PORT=$(free_port) || { err "no free port found"; exit 1; }
+  start "$PORT"; wait_ready
+  if [[ $STATE == DUSK_VIEW_ERROR*port* && $attempt == 1 ]]; then cleanup; PID=""; continue; fi
+  break
+done
+
+case $STATE in
+  DUSK_VIEW_READY*)
+    URL="http://localhost:$PORT/"
+    ok "${BOLD}Viewing ${HOST:+$HOST:}$TPATH${N}"
+    say "    $URL"
+    tr -d '\r' < "$LOG" | grep -q DUSK_VIEW_NO_OPENSLIDE && \
+      dim "  (no openslide/tifffile on ${HOST:-this computer}: PNG/JPEG work; slides need: peek --setup ${HOST})"
+    dim "  scroll to zoom · drag to pan · ←/→ next image · Esc back · ⌘-click opens a new tab · Ctrl-C here to stop"
+    open_url "$URL"
+    wait "$PID" ;;
+  DUSK_VIEW_MISSING*)
+    err "${HOST:-this computer} is missing Python packages: ${STATE#DUSK_VIEW_MISSING }"
+    read -r -p "  Install them now with pip --user? [y/N] " yn
+    if [[ $yn == [yY]* ]]; then cleanup; PID=""; setup "$HOST" && exec "$0" ${PYTHON:+--python "$PYTHON"} "$TARGET"; fi ;;
+  DUSK_VIEW_ERROR*)
+    err "${STATE#DUSK_VIEW_ERROR }" ;;
+  *)
+    err "the viewer did not start:"
+    grep -vE 'Address already in use|cannot listen to port|Could not request local forwarding|^bind' "$ERR" | tail -n 6 | sed 's/^/    /' >&2 ;;
+esac
