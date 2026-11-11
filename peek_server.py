@@ -141,6 +141,18 @@ class TiffPyramidSource:
         self.lock = TIFF_LOCK
         self.tif = tifffile.TiffFile(path)
         series = self.tif.series[0]
+        ome = self.tif.ome_metadata if self.tif.is_ome else None
+        if len(series.levels) == 1 and len(self.tif.pages) > 1:
+            # Some converters write the pyramid as reduced-resolution pages but describe only the
+            # full image in the OME-XML; tifffile then follows the XML and sees one level. Without
+            # the OME reading it finds the real pyramid.
+            alt = tifffile.TiffFile(path, is_ome=False)
+            if len(alt.series[0].levels) > 1:
+                self.tif.close()
+                self.tif, series = alt, alt.series[0]
+            else:
+                alt.close()
+        self._ome = ome
         axes = series.axes
         if "Y" not in axes or "X" not in axes:
             raise RuntimeError(f"unsupported axes {axes}")
@@ -152,10 +164,10 @@ class TiffPyramidSource:
         self.height, self.width = shape0[axes.index("Y")], shape0[axes.index("X")]
         self.downs = [self.width / lv.shape[axes.index("X")] for lv in series.levels]
         self.max_level = max(0, math.ceil(math.log2(max(self.width, self.height))))
-        self.props = {"format": "OME-TIFF" if self.tif.is_ome else "TIFF",
+        self.props = {"format": "OME-TIFF" if self._ome else "TIFF",
                       "levels": len(series.levels)}
-        if self.tif.is_ome and self.tif.ome_metadata:
-            om = self.tif.ome_metadata
+        if self._ome:
+            om = self._ome
             m = re.search(r'PhysicalSizeX="([^"]+)"', om)
             unit = re.search(r'PhysicalSizeXUnit="([^"]+)"', om)
             if m:
@@ -220,8 +232,12 @@ class TiffPyramidSource:
         return img if img.size == size else img.resize(size, Image.BILINEAR)
 
     def thumbnail(self, size):
+        xi, yi = self.axes.index("X"), self.axes.index("Y")
+        # smallest pyramid level that is still at least as big as the thumbnail
         k = len(self.levels) - 1
-        lw = self.levels[k].shape[self.axes.index("X")]; lh = self.levels[k].shape[self.axes.index("Y")]
+        while k > 0 and max(self.levels[k].shape[xi], self.levels[k].shape[yi]) < size:
+            k -= 1
+        lw = self.levels[k].shape[xi]; lh = self.levels[k].shape[yi]
         img = self._read(k, 0, 0, lw, lh)
         img.thumbnail((size, size))
         return img
